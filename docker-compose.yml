@@ -1,0 +1,180 @@
+name: reactive-lab
+
+# ─────────────────────────────────────────────────────────────────────
+# TOPOLOGÍA
+#
+#   ┌──────────────────── red lab (bridge interno) ────────────────────┐
+#   │                                                                  │
+#   │   k6  ──────►  mvc-app:8080     ──┐                              │
+#   │       ──────►  webflux-app:8080 ──┴──►  mysql:3306               │
+#   │                                                                  │
+#   └──────────────────────────────────────────────────────────────────┘
+#              ▲
+#              └── el tráfico de carga NO sale a Windows: es container
+#                  a container. Sin proxy de puertos de Docker Desktop
+#                  en el camino, que es la principal fuente de ruido
+#                  cuando k6 corre en el host.
+#
+# Los puertos publicados (8081/8082/3307) quedan solo para inspección
+# manual desde Windows: curl, actuator, cliente de MySQL.
+#
+# ─────────────────────────────────────────────────────────────────────
+# PERFILES
+#
+# Cada app vive en su propio perfil para poder medirla en aislamiento.
+# `docker compose up -d` sin perfil levanta únicamente MySQL, así que
+# es imposible arrancar las dos por accidente y contaminar la medición.
+#
+#   docker compose --profile mvc  up -d --build
+#   docker compose run --rm k6 run --env TARGET=mvc /scripts/load-test.js
+#   docker compose --profile mvc  down
+#
+#   docker compose --profile flux up -d --build
+#   docker compose run --rm k6 run --env TARGET=flux /scripts/load-test.js
+#
+# ─────────────────────────────────────────────────────────────────────
+
+# Las dos apps reciben EXACTAMENTE los mismos recursos y las mismas
+# opciones de JVM. Se declaran una sola vez con anclas YAML para que
+# no puedan desalinearse por descuido: si esto se desincroniza, la
+# comparación completa deja de valer.
+x-app-resources: &app-resources
+  resources:
+    limits:
+      cpus: "2.0"
+      memory: 1G
+
+x-app-jvm: &app-jvm "-XX:MaxRAMPercentage=50.0 -XX:+UseG1GC"
+
+# Spring Boot tarda más que los 10s de gracia por defecto en apagarse,
+# y el SIGKILL resultante deja exit code 137 — el mismo que un OOM kill.
+# Con 30s el apagado es limpio y un 137 sí significa que algo se rompió.
+x-app-stop-grace: &app-stop-grace 30s
+
+x-app-healthcheck: &app-healthcheck
+  test: ["CMD", "curl", "-fsS", "http://localhost:8080/actuator/health"]
+  interval: 5s
+  timeout: 3s
+  retries: 12
+  start_period: 40s
+
+services:
+
+  # ───────────────────────────────────────────────────────────────────
+  # MySQL — dependencia compartida, NO es el sujeto del experimento.
+  #
+  # Va deliberadamente holgado (4 CPU / 2 GB) porque si la base se
+  # vuelve el cuello de botella, las dos apps se estrangulan por igual
+  # y el laboratorio no muestra nada. La restricción tiene que estar
+  # en la app, que es lo que estamos comparando.
+  # ───────────────────────────────────────────────────────────────────
+  mysql:
+    image: mysql:8.0.36
+    container_name: lab-mysql
+    command:
+      - --max-connections=500
+      - --innodb-buffer-pool-size=536870912
+    environment:
+      MYSQL_ROOT_PASSWORD: root123
+      MYSQL_DATABASE: catalog_db
+    ports:
+      - "3307:3306"
+    volumes:
+      - ./init-db:/docker-entrypoint-initdb.d:ro
+      - mysql-data:/var/lib/mysql
+    healthcheck:
+      test: ["CMD", "mysqladmin", "ping", "-h", "127.0.0.1", "-uroot", "-proot123"]
+      interval: 5s
+      timeout: 5s
+      retries: 20
+    deploy:
+      resources:
+        limits:
+          cpus: "4.0"
+          memory: 2G
+    networks:
+      - lab
+
+  # ───────────────────────────────────────────────────────────────────
+  # Spring MVC — Tomcat, JDBC bloqueante, un hilo por request
+  # ───────────────────────────────────────────────────────────────────
+  mvc-app:
+    build: ./mvc-app
+    image: reactive-lab/mvc-app:1.0.0
+    container_name: lab-mvc
+    profiles: ["mvc"]
+    ports:
+      - "8081:8080"
+    environment:
+      SPRING_DATASOURCE_URL: jdbc:mysql://mysql:3306/catalog_db?useSSL=false&allowPublicKeyRetrieval=true
+      SPRING_DATASOURCE_USERNAME: root
+      SPRING_DATASOURCE_PASSWORD: root123
+      JAVA_OPTS: *app-jvm
+    depends_on:
+      mysql:
+        condition: service_healthy
+    deploy: *app-resources
+    healthcheck: *app-healthcheck
+    stop_grace_period: *app-stop-grace
+    networks:
+      - lab
+
+  # ───────────────────────────────────────────────────────────────────
+  # Spring WebFlux — Netty, R2DBC no bloqueante, event loop
+  # ───────────────────────────────────────────────────────────────────
+  webflux-app:
+    build: ./webflux-app
+    image: reactive-lab/webflux-app:1.0.0
+    container_name: lab-webflux
+    profiles: ["flux"]
+    ports:
+      - "8082:8080"
+    environment:
+      SPRING_R2DBC_URL: r2dbc:mysql://mysql:3306/catalog_db
+      SPRING_R2DBC_USERNAME: root
+      SPRING_R2DBC_PASSWORD: root123
+      JAVA_OPTS: *app-jvm
+    depends_on:
+      mysql:
+        condition: service_healthy
+    deploy: *app-resources
+    healthcheck: *app-healthcheck
+    stop_grace_period: *app-stop-grace
+    networks:
+      - lab
+
+  # ───────────────────────────────────────────────────────────────────
+  # k6 — generador de carga, dentro de la misma red.
+  #
+  # Sin container_name a propósito: se invoca con `docker compose run`,
+  # que genera su propio nombre por ejecución.
+  #
+  # 4 CPU son de sobra para los escenarios de este lab, pero si k6 se
+  # queda corto de CPU genera menos carga de la pedida y en silencio.
+  # Revisa siempre `dropped_iterations` en el reporte: si es > 0, el
+  # generador no alcanzó y los números no son comparables.
+  # ───────────────────────────────────────────────────────────────────
+  k6:
+    image: grafana/k6:1.8.1
+    profiles: ["load"]
+    entrypoint: ["k6"]
+    environment:
+      OUT_DIR: /results
+    volumes:
+      - ./k6:/scripts:ro
+      - ./results:/results
+    deploy:
+      resources:
+        limits:
+          cpus: "4.0"
+          memory: 1G
+    networks:
+      - lab
+
+volumes:
+  mysql-data:
+
+networks:
+  lab:
+    name: reactive-lab-net
+    driver: bridge

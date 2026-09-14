@@ -1,0 +1,23 @@
+server:
+  port: 8080
+
+spring:
+  application:
+    name: webflux-app
+  r2dbc:
+    url: ${SPRING_R2DBC_URL:r2dbc:mysql://localhost:3307/catalog_db}
+    username: ${SPRING_R2DBC_USERNAME:root}
+    password: ${SPRING_R2DBC_PASSWORD:root123}
+    pool:
+      initial-size: 5
+      max-size: 20
+      max-idle-time: 30m
+
+management:
+  endpoints:
+    web:
+      exposure:
+        include: health,metrics,info
+  endpoint:
+    health:
+      show-details: always
