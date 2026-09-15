@@ -1,0 +1,43 @@
+# ─────────────────────────────────────────────────────────────────────
+# OVERRIDE PARA concurrency-probe.js
+#
+# Uso:
+#   docker compose -f docker-compose.yml -f docker-compose.probe.yml `
+#     --profile flux up -d
+#
+# ¿Por qué existe este archivo?
+#
+# El probe de concurrencia mostró que WebFlux se topa en ~520 req/s, pero
+# midiendo CPU se vio que en ese punto MySQL estaba clavado en 400% de sus
+# 400% disponibles mientras la app se paseaba al 20-50% de sus 200%. O sea:
+# el techo era de la base, no del stack reactivo.
+#
+# Este override le duplica las CPU a MySQL para sacarla del camino y poder
+# encontrar el límite real de WebFlux. Si el techo se mueve hacia arriba,
+# confirma que MySQL era la causa. Si no se mueve, la causa era otra.
+#
+# NO se toca docker-compose.yml para que los resultados publicados en
+# results/ y citados en el README sigan siendo reproducibles tal cual.
+#
+# PRESUPUESTO DE CPU (la VM de Docker tiene 16):
+#   mysql 8  +  app 2  +  k6 5  =  15, deja 1 para el host.
+#
+# La app se queda en 2 CPU / 1 GB a propósito: es la constante bajo
+# prueba. Lo único que cambia es el entorno alrededor.
+# ─────────────────────────────────────────────────────────────────────
+
+services:
+
+  mysql:
+    deploy:
+      resources:
+        limits:
+          cpus: "8.0"
+          memory: 2G
+
+  k6:
+    deploy:
+      resources:
+        limits:
+          cpus: "5.0"
+          memory: 4G

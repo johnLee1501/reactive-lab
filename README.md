@@ -138,6 +138,12 @@ MySQL va deliberadamente holgado (4 CPU / 2 GB) porque es la dependencia
 compartida, no el sujeto del experimento. Si la base se estrangula, las dos apps
 se frenan por igual y el laboratorio no muestra nada.
 
+> **Hasta dónde vale eso.** Medido: en el rango del laboratorio principal
+> (máximo 600 VUs sobre `/slow`, unos 240 req/s) MySQL no es el límite. Por
+> encima de ~800 VUs **sí lo es**: a 1600 VUs queda clavada en 400% de sus 400%
+> disponibles mientras la app se pasea al 25% de su capacidad. Ver
+> [Buscando el límite de cada modelo](#buscando-el-límite-de-cada-modelo).
+
 ## Requisitos
 
 - Docker Desktop con Compose v2 (probado en v2.24.5)
@@ -185,6 +191,10 @@ Los resultados quedan en `results/`:
 | `results-flux.json` | idem |
 | `threads-mvc.csv` | serie temporal de `jvm.threads.live` |
 | `threads-flux.csv` | idem |
+| `probe-mvc.json` | probe de concurrencia, escalones hasta 3200 VUs |
+| `probe-flux-pool20.json` | probe de WebFlux con MySQL en 4 CPU |
+| `probe-flux-mysql8cpu.json` | probe de WebFlux con MySQL en 8 CPU |
+| `cpu-*.csv` | series de CPU de app y MySQL durante los probes |
 
 ## Endpoints
 
@@ -252,6 +262,115 @@ Con la calibración anterior de 200 VUs, la concurrencia efectiva era
 el mismo número (2032 ms contra 2040 ms, 0% de error en ambas). El escenario no
 probaba nada.
 
+## Buscando el límite de cada modelo
+
+`k6/concurrency-probe.js` es un experimento aparte del laboratorio principal.
+En lugar de comparar escenarios variados, sube la concurrencia en escalones
+sobre un único endpoint (`/slow`) para encontrar dónde se rompe cada modelo.
+El timeout del cliente se sube a 90 s a propósito, porque con los 15 s del lab
+principal MVC empezaría a fallar por timeout antes de poder medir la latencia
+real de su cola.
+
+```powershell
+docker compose --profile flux up -d
+docker compose run --rm k6 run --env TARGET=flux /scripts/concurrency-probe.js
+docker compose run --rm k6 run --env TARGET=flux --env STEPS=200,400,800,1600,3200,6400 /scripts/concurrency-probe.js
+```
+
+### MVC: el límite es su propio pool, y la latencia crece lineal
+
+| VUs | latencia avg | req/s | vs ideal | hilos vivos |
+|---|---|---|---|---|
+| 200 | 2074 ms | 80 | 1.04x | 215 |
+| 400 | 3485 ms | 104 | 1.74x | 215 |
+| 800 | 7194 ms | 113 | 3.60x | 215 |
+| 1600 | 13748 ms | 130 | 6.87x | 215 |
+| 3200 | 25387 ms | 161 | 12.69x | 215 |
+
+La latencia se duplica cada vez que se duplican los VUs, tal como predice la ley
+de Little con un techo de 200 hilos / 2 s ≈ 100 req/s.
+
+La columna de hilos es la más elocuente: **215 en los cinco escalones.** Con 16x
+más carga MVC no creó un solo hilo más. El pool es un techo duro y todo lo que no
+cabe se convierte en cola. Por eso no colapsa: se degrada linealmente sin fin. Lo
+que finalmente produce errores es el timeout del cliente, no la app.
+
+### WebFlux: no encontramos su límite
+
+Primera pasada, con MySQL en su configuración normal de 4 CPU:
+
+| VUs | latencia avg | req/s | vs ideal |
+|---|---|---|---|
+| 200 | 2036 ms | 80 | 1.02x |
+| 400 | 2046 ms | 160 | 1.02x |
+| 800 | 2133 ms | 312 | 1.07x |
+| 1600 | 3190 ms | 450 | 1.59x |
+| 3200 | 6115 ms | 514 | 3.06x |
+
+Plano hasta 800 VUs y después se dobla, con el throughput topado en ~515 req/s.
+Parecía el límite de WebFlux. No lo era.
+
+Este escalón se repitió tres veces y el techo se reprodujo dentro de un margen
+estrecho: 514, 526 y 504 req/s. La rodilla de 1600 VUs es la parte más variable
+(450, 527 y 487 req/s), porque es justo el punto donde el sistema empieza a
+saturar y ahí la medición es más sensible.
+
+**Hipótesis 1: el pool de R2DBC (20 conexiones). Falsificada.** Se levantó una
+instancia idéntica con `SPRING_R2DBC_POOL_MAX_SIZE=60` y el throughput **bajó**
+de 514 a 369 req/s. Más conexiones contra un recurso ya saturado solo agregan
+contención. Esta corrida no quedó archivada en `results/`; el resto de las cifras
+de esta sección sí.
+
+**Hipótesis 2: CPU de la app. Falsificada.** Midiendo `docker stats` durante los
+escalones, la app nunca pasó del 62% de sus 200% disponibles.
+
+**Causa real: MySQL.** En los escalones de 1600 y 3200 VUs quedaba clavada entre
+390% y 408% de sus 400%, con la app al 20-50%. El `COUNT(*)` que cuesta 4-8 ms
+sin carga sube a ~38 ms bajo contención, porque en InnoDB recorre el índice
+completo en cada llamada.
+
+Segunda pasada, duplicando MySQL a 8 CPU con `docker-compose.probe.yml` y
+dejando la app intacta en 2 CPU:
+
+| VUs | MySQL 4 CPU | MySQL 8 CPU |
+|---|---|---|
+| 800 | 2133 ms · 312 req/s | 2040 ms · 320 req/s |
+| 1600 | 3190 ms · 450 req/s | **2078 ms · 636 req/s** |
+| 3200 | 6115 ms · 514 req/s | **2396 ms · 1132 req/s** |
+| 6400 | — | 5058 ms · 1214 req/s |
+
+El techo pasó de ~515 a ~1213 req/s: **2.4x al duplicar las CPU de la base.**
+Eso confirma la causa por el mismo método que descartó las otras dos hipótesis.
+Si mueves un recurso y el techo se mueve con él, ese recurso era el límite.
+
+Y en el nuevo techo, MySQL vuelve a estar saturada:
+
+```
+utilización en los escalones de 3200 y 6400 VUs
+  app    :  71% de 200% disponibles  ->  35%   idle
+  mysql  : 762% de 800% disponibles  ->  95%   saturada
+```
+
+Así que **no encontramos el límite de WebFlux.** Cada vez que se le quita una
+restricción downstream, el techo sube y la app sigue con capacidad de sobra.
+Para medir el límite del stack reactivo puro habría que sacar la base del camino
+del request.
+
+### La conclusión que sale de esto
+
+MVC choca contra una pared interna a ~100 req/s: 200 hilos entre 2 s de bloqueo.
+Nada de lo que hagas con MySQL mueve ese número, porque el límite está en el
+modelo de ejecución.
+
+WebFlux no tiene pared propia detectable en este hardware. Su techo es siempre el
+del recurso más lento que tenga por detrás, y sube cuando ese recurso sube.
+
+Esa es la diferencia de fondo, y es un argumento más sólido que cualquier
+comparación de latencias: **el modelo imperativo se convierte él mismo en el
+recurso escaso; el reactivo deja que el recurso escaso sea el que realmente lo
+es.** Con MVC afinas la base de datos y no pasa nada. Con WebFlux afinas la base
+y ganas 2.3x.
+
 ## Decisiones de diseño del experimento
 
 Las que sostienen la validez de los resultados, por si alguien pregunta:
@@ -302,6 +421,17 @@ que k6 exponga cada fase por separado.
 - **`/api/catalogs` sin paginación.** Devolver 1000 filas por request hace que
   tres de los cinco escenarios midan sobre todo serialización. Es un caso real,
   pero conviene saber qué se está midiendo.
+- **Por encima de ~800 VUs, MySQL es el cuello de botella, no la app.** Afecta
+  únicamente al probe de concurrencia, no al laboratorio principal, que se queda
+  en 600 VUs. Está medido y documentado en
+  [Buscando el límite de cada modelo](#buscando-el-límite-de-cada-modelo), pero
+  vale repetirlo: los techos de throughput de WebFlux que aparecen ahí son techos
+  de la base de datos, no del framework.
+- **No se determinó el límite real de WebFlux.** Haría falta una variante de
+  `/slow` que solo espere, sin tocar la base, para sacar a MySQL del camino del
+  request. La extrapolación desde la utilización de CPU sugiere algo del orden de
+  los miles de req/s, pero es extrapolación, no medición, y no debería citarse
+  como dato.
 - **Latencia absoluta inflada** por la capa de virtualización de Docker Desktop
   sobre WSL2.
 
@@ -340,10 +470,13 @@ curl http://localhost:8082/actuator/metrics/jvm.threads.live
 ```
 reactive-lab/
 ├── docker-compose.yml          # perfiles, límites por anclas YAML, k6 en la red
+├── docker-compose.probe.yml    # override: MySQL a 8 CPU para el probe
 ├── run-lab.ps1                 # runner de PowerShell + muestreo de hilos
 ├── init-db/init.sql            # schema + 1000 catálogos seed
-├── k6/load-test.js             # 5 escenarios, desglose por escenario
-├── results/                    # JSON de k6 + CSV de hilos
+├── k6/
+│   ├── load-test.js            # laboratorio principal, 5 escenarios
+│   └── concurrency-probe.js    # escalones de concurrencia, busca el límite
+├── results/                    # JSON de k6 + CSV de hilos y CPU
 ├── mvc-app/                    # Spring MVC — Tomcat, JPA/Hibernate, JDBC
 │   └── src/main/java/com/lab/mvc/
 │       ├── model/Catalog.java          # entidad JPA

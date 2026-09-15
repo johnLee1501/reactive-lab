@@ -149,10 +149,15 @@ services:
   # Sin container_name a propósito: se invoca con `docker compose run`,
   # que genera su propio nombre por ejecución.
   #
-  # 4 CPU son de sobra para los escenarios de este lab, pero si k6 se
-  # queda corto de CPU genera menos carga de la pedida y en silencio.
-  # Revisa siempre `dropped_iterations` en el reporte: si es > 0, el
-  # generador no alcanzó y los números no son comparables.
+  # Si k6 se queda corto de CPU o memoria genera menos carga de la pedida,
+  # y lo hace en silencio. Revisa siempre `dropped_iterations`: si es > 0,
+  # el generador fue el cuello de botella y los números no dicen nada
+  # sobre la app.
+  #
+  # Va holgado (6 CPU / 4 GB) porque concurrency-probe.js llega a 3200 VUs.
+  # El host tiene 16 CPU y las apps están capadas a 2, así que sobra. Darle
+  # más recursos al generador nunca invalida una medición: solo reduce la
+  # probabilidad de que el generador sea el límite.
   # ───────────────────────────────────────────────────────────────────
   k6:
     image: grafana/k6:1.8.1
@@ -166,8 +171,8 @@ services:
     deploy:
       resources:
         limits:
-          cpus: "4.0"
-          memory: 1G
+          cpus: "6.0"
+          memory: 4G
     networks:
       - lab
 
