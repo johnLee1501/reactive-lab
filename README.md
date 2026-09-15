@@ -191,9 +191,12 @@ Los resultados quedan en `results/`:
 | `results-flux.json` | idem |
 | `threads-mvc.csv` | serie temporal de `jvm.threads.live` |
 | `threads-flux.csv` | idem |
-| `probe-mvc.json` | probe de concurrencia, escalones hasta 3200 VUs |
-| `probe-flux-pool20.json` | probe de WebFlux con MySQL en 4 CPU |
-| `probe-flux-mysql8cpu.json` | probe de WebFlux con MySQL en 8 CPU |
+| `probe-mvc.json` | probe sobre `/slow`, escalones hasta 3200 VUs |
+| `probe-flux-pool20.json` | probe sobre `/slow` con MySQL en 4 CPU |
+| `probe-flux-mysql8cpu.json` | probe sobre `/slow` con MySQL en 8 CPU |
+| `probe-mvc-nodb.json` | probe sobre `/slow-nodb`, hasta 6400 VUs |
+| `probe-flux-nodb.json` | idem WebFlux, hasta 6400 VUs |
+| `probe-flux-nodb-max.json` | WebFlux hasta 12800 VUs (6259 req/s) |
 | `cpu-*.csv` | series de CPU de app y MySQL durante los probes |
 
 ## Endpoints
@@ -206,6 +209,7 @@ Ambas apps exponen la misma superficie:
 | `GET /api/catalogs/{id}` | Un catálogo por ID |
 | `GET /api/catalogs/category/{cat}` | Filtrar por categoría |
 | `GET /api/catalogs/slow` | **Endpoint clave** — 2 s de espera + `count()` |
+| `GET /api/catalogs/slow-nodb` | 2 s de espera y nada más. Solo lo usa el probe |
 | `GET /api/catalogs/health-check` | Estado + nombre del hilo que atendió |
 | `GET /actuator/health` | Health check de Spring |
 | `GET /actuator/metrics/jvm.threads.live` | Hilos vivos en la JVM |
@@ -295,7 +299,7 @@ más carga MVC no creó un solo hilo más. El pool es un techo duro y todo lo qu
 cabe se convierte en cola. Por eso no colapsa: se degrada linealmente sin fin. Lo
 que finalmente produce errores es el timeout del cliente, no la app.
 
-### WebFlux: no encontramos su límite
+### WebFlux sobre `/slow`: el techo no es del framework, es de MySQL
 
 Primera pasada, con MySQL en su configuración normal de 4 CPU:
 
@@ -351,25 +355,117 @@ utilización en los escalones de 3200 y 6400 VUs
   mysql  : 762% de 800% disponibles  ->  95%   saturada
 ```
 
-Así que **no encontramos el límite de WebFlux.** Cada vez que se le quita una
-restricción downstream, el techo sube y la app sigue con capacidad de sobra.
-Para medir el límite del stack reactivo puro habría que sacar la base del camino
-del request.
+Así que con `/slow` no se puede medir el límite de WebFlux: cada vez que se le
+quita una restricción downstream, el techo sube y la app sigue con capacidad de
+sobra. Para eso hace falta sacar la base del camino del request.
+
+### Sacando la base del camino: `/slow-nodb`
+
+`/api/catalogs/slow-nodb` es un gemelo de `/slow` que **solo espera 2 segundos**,
+sin ningún query. Reduce el request a lo esencial: aceptar la conexión, esperar,
+serializar dos campos. Así la única variable que queda es cómo maneja cada
+framework la espera.
+
+```powershell
+docker compose -f docker-compose.yml -f docker-compose.probe.yml --profile flux up -d
+docker compose -f docker-compose.yml -f docker-compose.probe.yml run --rm k6 run `
+  --env TARGET=flux --env ENDPOINT=/api/catalogs/slow-nodb --env THINK=0 `
+  --env TAG=-nodb --env STEPS=400,800,1600,3200,6400 /scripts/concurrency-probe.js
+```
+
+**MVC no se movió ni un milímetro.** Su techo es el mismo con base y sin base:
+
+| VUs | `/slow` (con `COUNT`) | `/slow-nodb` (sin BD) |
+|---|---|---|
+| 400 | 104 req/s | 107 req/s |
+| 800 | 113 req/s | 116 req/s |
+| 1600 | 130 req/s | 133 req/s |
+| 3200 | 161 req/s | 164 req/s |
+| 6400 | — | 142 req/s · **9.36% errores** |
+
+Ese resultado negativo vale tanto como el positivo: confirma que el límite de MVC
+es **exclusivamente su modelo de ejecución**. Quitarle trabajo a la base no le
+sirve de nada, porque el recurso escaso son sus 200 hilos.
+
+A 6400 VUs aparece por fin su modo de falla: 39496 ms de latencia promedio y
+9.36% de errores, con `dial: i/o timeout` en el log de k6. Ya no es encolamiento,
+es la accept queue de Tomcat desbordada y conexiones que no llegan a
+establecerse. El pico de hilos siguió siendo 215.
+
+**WebFlux se quedó plano hasta donde el generador dio:**
+
+| VUs | latencia avg | p99 | req/s | vs ideal | err% |
+|---|---|---|---|---|---|
+| 400 | 2005 ms | 2143 ms | 204 | 1.00x | 0 |
+| 800 | 2003 ms | 2022 ms | 409 | 1.00x | 0 |
+| 1600 | 2003 ms | 2026 ms | 818 | 1.00x | 0 |
+| 3200 | 2009 ms | 2074 ms | 1636 | 1.00x | 0 |
+| 6400 | 2019 ms | 2209 ms | 3263 | 1.01x | 0 |
+| 12800 | 2033 ms | 2470 ms | **6259** | 1.02x | 0 |
+
+**1.00x del ideal teórico durante cinco duplicaciones de carga.** A 12800
+usuarios concurrentes sirviendo 6259 req/s, el promedio está 33 ms por encima de
+la espera pura de 2 segundos y el p99 a 470 ms. Cero errores en todos los
+escalones, `dropped_iterations = 0` siempre.
+
+Y en el escalón más alto:
+
+```
+  hilos vivos  :  22          (los mismos que en reposo)
+  CPU app      :  42% de 200% disponibles  ->  21% de utilizacion
+  CPU MySQL    :  0.5%                     ->  fuera del camino del request
+```
+
+**Tampoco acá encontramos el límite de WebFlux.** Lo que topamos es la aritmética
+del generador: con N usuarios y una espera de 2 s sin think time, el throughput
+máximo que se puede provocar es `N / 2`. Con 12800 VUs eso son 6400 req/s, y
+medimos 6259. La app estaba al 21% de su CPU.
+
+Un detalle que aparece acá: en `/slow-nodb` WebFlux responde en el hilo
+`parallel-2`, no en `reactor-tcp-epoll-*`. Es el worker de `Schedulers.parallel()`
+que dispara el timer de `Mono.delay`; sin llamada a la base, la cadena termina
+ahí. Otra confirmación de que ningún hilo queda asignado a un request.
+
+> **Caveat.** El probe de `/slow-nodb` usa `THINK=0` mientras el de `/slow` usaba
+> `THINK=0.5`, así que entre las dos tablas de MVC cambiaron dos variables, no
+> una. El efecto del think time es pequeño y va en contra de MVC (sin pausa la
+> concurrencia efectiva es mayor, y de hecho la latencia sale levemente peor),
+> así que la conclusión se sostiene. Pero conviene decirlo en lugar de presentar
+> la comparación como perfectamente controlada.
 
 ### La conclusión que sale de esto
 
-MVC choca contra una pared interna a ~100 req/s: 200 hilos entre 2 s de bloqueo.
-Nada de lo que hagas con MySQL mueve ese número, porque el límite está en el
-modelo de ejecución.
+Con la misma carga y el mismo hardware, sobre un endpoint que solo espera:
 
-WebFlux no tiene pared propia detectable en este hardware. Su techo es siempre el
-del recurso más lento que tenga por detrás, y sube cuando ese recurso sube.
+| a 6400 VUs | MVC | WebFlux |
+|---|---|---|
+| latencia avg | 39496 ms | **2019 ms** |
+| throughput | 142 req/s | **3263 req/s** |
+| errores | 9.36% | **0%** |
+| hilos vivos | 215 | **22** |
+| CPU usada | tope de hilos, no de CPU | 21% de la disponible |
+
+**23x el throughput, 20x menos latencia, y sin errores.**
+
+MVC choca contra una pared interna a ~100-165 req/s: 200 hilos entre 2 s de
+bloqueo. Está medido que ni quitarle la base ni darle más CPU a MySQL mueve ese
+número, porque el recurso escaso es su pool de hilos.
+
+WebFlux no tiene pared propia detectable en este hardware. Sobre `/slow` su techo
+era el de MySQL y subió 2.4x al duplicar las CPU de la base. Sobre `/slow-nodb`
+llegó a 6259 req/s con 22 hilos y el 21% de su CPU, y ahí el límite fue el
+generador de carga, no la app.
 
 Esa es la diferencia de fondo, y es un argumento más sólido que cualquier
 comparación de latencias: **el modelo imperativo se convierte él mismo en el
 recurso escaso; el reactivo deja que el recurso escaso sea el que realmente lo
 es.** Con MVC afinas la base de datos y no pasa nada. Con WebFlux afinas la base
-y ganas 2.3x.
+y ganas 2.4x.
+
+Con la contrapartida ya vista en el laboratorio principal: cuando el trabajo es
+serializar 1000 filas en lugar de esperar, MVC es entre 1.9x y 2.2x más eficiente.
+La pregunta de arquitectura no es qué modelo es mejor, sino en qué régimen vive tu
+servicio.
 
 ## Decisiones de diseño del experimento
 
@@ -427,11 +523,15 @@ que k6 exponga cada fase por separado.
   [Buscando el límite de cada modelo](#buscando-el-límite-de-cada-modelo), pero
   vale repetirlo: los techos de throughput de WebFlux que aparecen ahí son techos
   de la base de datos, no del framework.
-- **No se determinó el límite real de WebFlux.** Haría falta una variante de
-  `/slow` que solo espere, sin tocar la base, para sacar a MySQL del camino del
-  request. La extrapolación desde la utilización de CPU sugiere algo del orden de
-  los miles de req/s, pero es extrapolación, no medición, y no debería citarse
-  como dato.
+- **Sigue sin determinarse el límite de WebFlux.** Con `/slow-nodb` se llegó a
+  6259 req/s con la app al 21% de su CPU, pero ahí el techo lo puso el generador,
+  no la app: con una espera de 2 s y sin think time, N usuarios solo pueden
+  provocar `N / 2` req/s. Para seguir haría falta más de 12800 VUs, y a esa altura
+  conviene distribuir k6 en varias máquinas en lugar de una sola.
+- **El probe de `/slow-nodb` usa `THINK=0` y el de `/slow` usa `THINK=0.5`.** Al
+  comparar las dos tablas de MVC cambiaron dos variables. El efecto del think time
+  es pequeño y perjudica a MVC, así que no altera la conclusión, pero la
+  comparación no es perfectamente controlada.
 - **Latencia absoluta inflada** por la capa de virtualización de Docker Desktop
   sobre WSL2.
 

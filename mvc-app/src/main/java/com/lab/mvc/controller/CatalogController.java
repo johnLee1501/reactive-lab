@@ -85,6 +85,38 @@ public class CatalogController {
     }
 
     /**
+     * GET /api/catalogs/slow-nodb
+     *
+     * Variante de /slow SIN base de datos.
+     *
+     * El probe de concurrencia mostró que /slow se topa en el techo de
+     * MySQL y no en el del framework: a 1600 VUs la base queda saturada
+     * mientras la app usa un cuarto de su CPU. Con la base en el camino del
+     * request es imposible medir el límite del modelo de ejecución.
+     *
+     * Este endpoint reduce el request a lo esencial: aceptar la conexión,
+     * esperar 2 segundos, serializar dos campos. Nada más. Así la única
+     * variable que queda es cómo maneja cada framework la espera.
+     *
+     * Para MVC el resultado deberia ser identico al de /slow: su techo es
+     * 200 hilos entre 2 s de bloqueo, y eso no depende de la base.
+     *
+     * No se usa en el laboratorio principal. Existe solo para
+     * concurrency-probe.js, y su gemelo en webflux-app debe mantenerse
+     * simétrico.
+     */
+    @GetMapping("/slow-nodb")
+    public Map<String, Object> getSlowNoDb() throws InterruptedException {
+        // Unica operacion del request: el hilo de Tomcat queda BLOQUEADO.
+        Thread.sleep(2000);
+
+        return Map.of(
+            "framework", "Spring MVC",
+            "thread", Thread.currentThread().getName()
+        );
+    }
+
+    /**
      * GET /api/catalogs/health-check
      * Quick endpoint to verify the app is alive and DB is reachable.
      */

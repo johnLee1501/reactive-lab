@@ -47,13 +47,34 @@ if (!IN_NETWORK_URLS[TARGET]) {
 const BASE_URL = __ENV.BASE_URL || IN_NETWORK_URLS[TARGET];
 const OUT_DIR = __ENV.OUT_DIR || '.';
 
+// Endpoint bajo prueba.
+//
+//   /api/catalogs/slow        espera 2 s + COUNT(*)  -> el techo es de MySQL
+//   /api/catalogs/slow-nodb   espera 2 s y nada mas  -> el techo es del framework
+//
+// La variante nodb existe porque con la base en el camino del request es
+// imposible medir el limite del modelo de ejecucion: MySQL satura primero.
+const ENDPOINT = __ENV.ENDPOINT || '/api/catalogs/slow';
+
+// Think time entre iteraciones, en segundos.
+//
+// Afecta directamente el techo detectable. Cada VU completa como maximo
+// una iteracion cada (2 s de espera + THINK), asi que el throughput
+// maximo que N usuarios pueden provocar es N / (2 + THINK) req/s.
+//
+//   THINK=0.5 -> 3200 VUs alcanzan para 1280 req/s
+//   THINK=0   -> 3200 VUs alcanzan para 1600 req/s
+//
+// Para buscar techos altos conviene THINK=0: exprime mas carga por VU y
+// asi el generador se convierte en el limite mas tarde.
+const THINK = parseFloat(__ENV.THINK !== undefined ? __ENV.THINK : '0.5');
+
+// Sufijo del archivo de salida, para no sobrescribir corridas anteriores.
+//   --env TAG=-nodb  ->  results/probe-flux-nodb.json
+const TAG = __ENV.TAG || '';
+
 // Escalones de concurrencia. Cada uno es su propio escenario para que k6
 // lo etiquete por separado y podamos ver la curva escalón por escalón.
-//
-// Configurable porque el techo detectable está acotado por los VUs: con N
-// usuarios y un ideal de 2 s + 0.5 s de think time, el throughput máximo
-// que se puede provocar es N / 2.5 req/s. Con 3200 VUs eso son 1280 req/s,
-// así que para buscar techos más altos hay que agregar escalones:
 //
 //   --env STEPS=200,400,800,1600,3200,6400
 const STEPS = (__ENV.STEPS || '200,400,800,1600,3200')
@@ -92,11 +113,13 @@ export const options = {
 };
 
 export function slowEndpoint() {
-    const res = http.get(`${BASE_URL}/api/catalogs/slow`, { timeout: '90s' });
+    const res = http.get(`${BASE_URL}${ENDPOINT}`, { timeout: '90s' });
 
     check(res, { 'status is 200': (r) => r.status === 200 });
 
-    sleep(0.5);
+    if (THINK > 0) {
+        sleep(THINK);
+    }
 }
 
 export function handleSummary(data) {
@@ -104,9 +127,13 @@ export function handleSummary(data) {
     const lines = [];
     const W = 86;
 
+    const maxVus = Math.max.apply(null, STEPS);
+    const detectableCeiling = maxVus / (2 + THINK);
+
     lines.push(`\n${'='.repeat(W)}`);
     lines.push(`  CONCURRENCY PROBE: ${TARGET.toUpperCase()}  (${BASE_URL})`);
-    lines.push(`  endpoint /api/catalogs/slow  |  ideal teorico = 2000 ms`);
+    lines.push(`  endpoint ${ENDPOINT}  |  think ${THINK}s  |  ideal teorico = 2000 ms`);
+    lines.push(`  techo maximo detectable con ${maxVus} VUs: ${detectableCeiling.toFixed(0)} req/s`);
     lines.push(`${'='.repeat(W)}\n`);
 
     lines.push(
@@ -164,8 +191,18 @@ export function handleSummary(data) {
 
     return {
         stdout: lines.join('\n'),
-        [`${OUT_DIR}/probe-${TARGET}.json`]: JSON.stringify({
-            run: { target: TARGET, base_url: BASE_URL, steps: STEPS, step_duration_s: STEP_DURATION, timestamp: new Date().toISOString() },
+        [`${OUT_DIR}/probe-${TARGET}${TAG}.json`]: JSON.stringify({
+            run: {
+                target: TARGET,
+                base_url: BASE_URL,
+                endpoint: ENDPOINT,
+                think_s: THINK,
+                steps: STEPS,
+                step_duration_s: STEP_DURATION,
+                detectable_ceiling_rps: detectableCeiling,
+                dropped_iterations: dropped,
+                timestamp: new Date().toISOString(),
+            },
             rows: rows,
             metrics: m,
         }, null, 2),

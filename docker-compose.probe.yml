@@ -35,9 +35,20 @@ services:
           cpus: "8.0"
           memory: 2G
 
+  # k6 va muy holgado porque el probe llega a escalones de miles de VUs y el
+  # generador NO puede ser el límite. Cada VU inactivo consume poca memoria,
+  # pero a 6400 VUs eso ya suma.
+  #
+  # Los límites de CPU de Docker son topes, no reservas: un contenedor
+  # inactivo no consume su cuota. En el probe de /slow-nodb MySQL queda
+  # completamente idle, así que sus 8 CPU quedan disponibles en la práctica
+  # y k6 puede usar las suyas sin competir.
+  #
+  # Vigilar siempre `dropped_iterations` en el reporte: es el indicador de
+  # que k6 se quedó corto y que el escalón no dice nada sobre la app.
   k6:
     deploy:
       resources:
         limits:
-          cpus: "5.0"
-          memory: 4G
+          cpus: "8.0"
+          memory: 8G
