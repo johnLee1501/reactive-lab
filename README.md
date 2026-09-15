@@ -197,7 +197,9 @@ Los resultados quedan en `results/`:
 | `probe-mvc-nodb.json` | probe sobre `/slow-nodb`, hasta 6400 VUs |
 | `probe-flux-nodb.json` | idem WebFlux, hasta 6400 VUs |
 | `probe-flux-nodb-max.json` | WebFlux hasta 12800 VUs (6259 req/s) |
-| `cpu-*.csv` | series de CPU de app y MySQL durante los probes |
+| `probe-mvc-nodb-t2000.json` | MVC con `threads.max=2000` |
+| `probe-mvc-nodb-t6400.json` | MVC con `threads.max=6400` |
+| `cpu-*.csv` | series de CPU y memoria durante los probes |
 
 ## Endpoints
 
@@ -433,6 +435,73 @@ ahí. Otra confirmación de que ningún hilo queda asignado a un request.
 > así que la conclusión se sostiene. Pero conviene decirlo en lugar de presentar
 > la comparación como perfectamente controlada.
 
+### ¿Y si simplemente le subes los hilos a MVC?
+
+Es la objeción más obvia al laboratorio, así que también está medida. Se levantó
+la misma imagen de `mvc-app` con los mismos 2 CPU / 1 GB, cambiando solo
+`SERVER_TOMCAT_THREADS_MAX`, y se corrió el mismo probe sobre `/slow-nodb`.
+
+**Funciona, y funciona de forma predecible.** El techo resultó ser exactamente
+`hilos / tiempo de bloqueo`:
+
+```
+  200 hilos / 2 s  =   100 req/s teoricos    medido: 104-165
+ 2000 hilos / 2 s  =  1000 req/s teoricos    medido: 1020-1049
+```
+
+Con 2000 hilos, MVC se queda plano en 1.00x del ideal hasta 1600 VUs, algo que
+con 200 hilos no lograba ni a 400:
+
+| VUs | 200 hilos | 2000 hilos |
+|---|---|---|
+| 400 | 3902 ms · 107 req/s | **2004 ms · 203 req/s** · 1.00x |
+| 800 | 7444 ms · 116 req/s | **2002 ms · 407 req/s** · 1.00x |
+| 1600 | 13974 ms · 133 req/s | **2006 ms · 818 req/s** · 1.00x |
+| 3200 | 25422 ms · 164 req/s | 3161 ms · 1049 req/s · 1.58x |
+| 6400 | 39496 ms · 142 req/s · 9.36% err | 5581 ms · 1020 req/s · 2.79x · 2.16% err |
+
+Seis a siete veces más throughput por cambiar un número en la configuración. Si el
+laboratorio se detuviera antes de este experimento, estaría escondiendo algo.
+
+**Pero hay un óptimo, y pasarlo empeora las cosas.** Con 6400 hilos, la misma
+carga de 6400 VUs:
+
+| `threads.max` | a 6400 VUs | memoria | CPU |
+|---|---|---|---|
+| 2000 | 1020 req/s · p99 6507 ms | 99% de 1 GB | 91% de 2 CPU |
+| **6400** | **307 req/s** · p99 16493 ms | **100% de 1 GB** | **95% de 2 CPU** |
+
+Triplicar los hilos dividió el throughput entre tres. La memoria queda clavada en
+1024 MiB de 1024 y la CPU al 95%, pero esa CPU no está atendiendo requests: está
+recolectando basura. Con el heap en 512 MB no caben 6400 requests en vuelo, así
+que el GC corre sin parar. Pagas la CPU completa para hacer un tercio del trabajo.
+
+Como referencia, WebFlux con la misma carga y el mismo hardware: **3263 req/s,
+22 hilos, 21% de CPU, 0% de errores.**
+
+### Los tres costos que la tabla no muestra
+
+**La memoria se paga por request concurrente, no por hilo.** No es solo el stack.
+Es el stack más el objeto request, los buffers y todo lo que vive mientras el hilo
+está ocupado. Medido acá: la app pasó de 242 MiB en reposo a 1014 MiB con 2000
+requests en vuelo, o sea unos **386 KB por request concurrente**.
+
+**Hay que conocer el pico de antemano.** Afinar el pool es comprometerse con un
+techo de concurrencia. Te quedas corto y encolas; te pasas y el GC te come. Y el
+número correcto depende del tiempo de bloqueo, que suele depender de un servicio
+que no controlas: si tu proveedor pasa de 2 s a 6 s, tu techo se divide entre tres
+y el pool que habías calculado deja de servir.
+
+**Con base de datos en el camino, los hilos casi no importan.** Este experimento
+usa `/slow-nodb` a propósito. Sobre `/slow`, el pool de conexiones (20) topa el
+throughput en `20 / tiempo de query` sin importar si hay 200 o 6000 hilos. Más
+hilos solo mueven la cola: en lugar de esperar por un hilo, los requests esperan
+por una conexión.
+
+Así que la respuesta honesta no es que el modelo imperativo no escale. Es que
+**escala comprando memoria, con un óptimo que hay que encontrar y mantener.** El
+reactivo llega al mismo lugar sin comprar nada y sin ningún número que afinar.
+
 ### La conclusión que sale de esto
 
 Con la misma carga y el mismo hardware, sobre un endpoint que solo espera:
@@ -447,9 +516,11 @@ Con la misma carga y el mismo hardware, sobre un endpoint que solo espera:
 
 **23x el throughput, 20x menos latencia, y sin errores.**
 
-MVC choca contra una pared interna a ~100-165 req/s: 200 hilos entre 2 s de
-bloqueo. Está medido que ni quitarle la base ni darle más CPU a MySQL mueve ese
-número, porque el recurso escaso es su pool de hilos.
+MVC choca contra una pared interna a ~100-165 req/s con su pool por defecto: 200
+hilos entre 2 s de bloqueo. Está medido que ni quitarle la base ni darle más CPU a
+MySQL mueve ese número, porque el recurso escaso es su pool de hilos. Subiendo el
+pool a 2000 la pared se corre a ~1050 req/s, pero a costa del 99% de la memoria
+del contenedor, y subirlo a 6400 la empeora en lugar de mejorarla.
 
 WebFlux no tiene pared propia detectable en este hardware. Sobre `/slow` su techo
 era el de MySQL y subió 2.4x al duplicar las CPU de la base. Sobre `/slow-nodb`
@@ -532,6 +603,13 @@ que k6 exponga cada fase por separado.
   comparar las dos tablas de MVC cambiaron dos variables. El efecto del think time
   es pequeño y perjudica a MVC, así que no altera la conclusión, pero la
   comparación no es perfectamente controlada.
+- **El experimento de tamaño de pool no está en el compose.** Las variantes con
+  `threads.max` de 2000 y 6400 se levantaron como contenedores sueltos con
+  `docker run`, usando la misma imagen y los mismos límites (2 CPU / 1 GB) y
+  cambiando solo `SERVER_TOMCAT_THREADS_MAX`. Los resultados están archivados en
+  `results/`, pero reproducirlos requiere levantar esos contenedores a mano.
+- **Solo se probaron tres tamaños de pool** (200, 2000, 6400). El óptimo real está
+  en algún punto entre 2000 y 6400 y no se buscó con precisión.
 - **Latencia absoluta inflada** por la capa de virtualización de Docker Desktop
   sobre WSL2.
 
